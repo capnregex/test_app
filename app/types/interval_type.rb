@@ -29,18 +29,39 @@ class IntervalType < ActiveModel::Type::Value
     end
   end 
 
+  protected
+
+  POSTGRES_VERBOSE = /(?<part>(?<qty>[+-]?\d)\s*(?<unit>\w+)\s*)*?(ago)?/
+
+  def cast_postgres_verbose(value)
+    result = POSTGRES_VERBOSE.match(value)
+    binding.pry
+  end
+
   def cast_iso8601(value)
     ActiveSupport::Duration.parse(value) 
   rescue ActiveSupport::Duration::ISO8601Parser::ParsingError => e
-    nil
+    cast_postgres_verbose(value)
+  end
+
+  def cast_parts(value)
+    parts = value.slice(*ActiveSupport::Duration::PARTS)
+    seconds = ActiveSupport::Duration.send(:calculate_total_seconds, parts)
+    ActiveSupport::Duration.new(seconds, parts)
   end
 
   def cast_value(value)
     case value
+    when Numeric
+      ActiveSupport::Duration.build(value)
     when ActiveSupport::Duration 
       value
+    when Hash
+      cast_parts(value)
     when String
       cast_iso8601(value)
+    else
+      nil
     end
   end
 
