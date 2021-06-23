@@ -2,108 +2,170 @@
 
 require "strscan"
 
-class Interval
-    # Parses a string formatted according to postgresql verbose interval format into the hash.
-    #
-    # See https://www.postgresql.org/docs/9.5/datatype-datetime.html#DATATYPE-INTERVAL-INPUT
-    #
-    # This parser allows negative parts to be present in pattern.
-    class PostgresVerboseParser # :nodoc:
-      class ParsingError < ::ArgumentError; end
+# Parses a string formatted according to postgresql verbose interval format into the hash.
+#
+# See https://www.postgresql.org/docs/9.5/datatype-datetime.html#DATATYPE-INTERVAL-INPUT
+#
+# This parser allows negative parts to be present in pattern.
+class  Interval::PostgresVerboseParser # :nodoc:
+  class ParsingError < ::ArgumentError; end
 
-      COMPONENT = /(\-?\d+(?:[.,]\d+)?)\s*(\w+)\s*/
+  PERIOD_OR_COMMA = /\.|,/
+  PERIOD = "."
+  COMMA = ","
+  BLANK = /\s*/
 
-      attr_reader :parts, :scanner
-      attr_accessor :mode, :sign
+  ISO_P = /p/
+  ISO_T = /t/
+  ISO_VALUE_YMWD = /([+\-]?\d+(?:[.,]\d+)?)([ymwd])/
+  ISO_ALT_YMD = /(\d+)(?:-(\d+)(?:-(\d+))?)?/
+  ISO_VALUE_HMS = /([+\-]?\d+(?:[.,]\d+)?)([hms])/
+  ISO_ALT_HMS = /(-?\d+(?:[.,]\d+)?)(?::(-?\d+(?:[.,]\d+)?)(?::(-?\d+(?:[.,]\d+)?))?)?/
+  ISO_YMWD = { 'y' => 'year', 'm' => 'month', 'w' => 'week', 'd' => 'day' }
+  ISO_HMS = { 'h' => 'hour', 'm' => 'minute', 's' => 'second' }
 
-      def initialize(string)
-        @scanner = StringScanner.new(string)
-        @parts = {}
-        @mode = :start
-        @sign = 1
-      end
+  SQL_AT = /@\s*/
+  SQL_YM = /(\d+)-(\d+)\s*/
+  SQL_DHMS = /(?:([+-]?\d+)\s+)?([+-])?(?:(\d+):)?(?:(\d+):)?(\d+(?:[.,]\d+)?)\s*/
+  SQL_VERBOSE = /([+\-]?\d+(?:[.,]\d+)?)\s*([a-z]+)\s*/
+  SQL_AGO = /ago/
+    
+  SQL_UNITS = {
+    'micro' => 'microsecond',
+    'milli' => 'millisecond',
+    's' => 'second',
+    'sec' => 'second',
+    'm' => 'minute',
+    'min' => 'minute',
+    'h' => 'hour',
+    'd' => 'day',
+    'w' => 'week',
+    'mon' => 'month',
+    'y' => 'year'
+  }
 
-      def parse!
-        while !finished?
-          case mode
-          when :start
-            if scan(SIGN_MARKER)
-              self.sign = (scanner.matched == "-") ? -1 : 1
-              self.mode = :sign
-            else
-              raise_parsing_error
-            end
+  UNITS = {
+    'microsecond' => { part: :seconds, multiplier: 0.000001 },
+    'millisecond' => { part: :seconds, multiplier: 0.001 },
+    'second' => { part: :seconds, multiplier: 1 },
+    'minute' => { part: :minutes, multiplier: 1 },
+    'hour' => { part: :hours, multiplier: 1 },
+    'day' => { part: :days, multiplier: 1 },
+    'week' => { part: :days, multiplier: 7 },
+    'month' => { part: :months, multiplier: 1 },
+    'year' => { part: :years, multiplier: 1 },
+    'decade' => { part: :years, multiplier: 10 },
+    'century' => { part: :years, multiplier: 100 },
+    'millennium' => { part: :years, multiplier: 1000 }
+  }
 
-          when :sign
-            if scan(DATE_MARKER)
-              self.mode = :date
-            else
-              raise_parsing_error
-            end
+  attr_reader :parts, :scanner
+  delegate :string, :scan, :eos?, to: :scanner
 
-          when :date
-            if scan(TIME_MARKER)
-              self.mode = :time
-            elsif scan(DATE_COMPONENT)
-              parts[DATE_TO_PART[scanner[2]]] = number * sign
-            else
-              raise_parsing_error
-            end
+  def initialize(string)
+    @scanner = StringScanner.new(string.downcase.strip)
+    @parts = Hash.new(0)
+  end
 
-          when :time
-            if scan(TIME_COMPONENT)
-              parts[TIME_TO_PART[scanner[2]]] = number * sign
-            else
-              raise_parsing_error
-            end
-
-          end
-        end
-
-        # validate!
-        parts
-      end
-
-      private
-        def finished?
-          scanner.eos?
-        end
-
-        # Parses number which can be a float with either comma or period.
-        def number
-          PERIOD_OR_COMMA.match?(scanner[1]) ? scanner[1].tr(COMMA, PERIOD).to_f : scanner[1].to_i
-        end
-
-        def scan(pattern)
-          scanner.scan(pattern)
-        end
-
-        def raise_parsing_error(reason = nil)
-          raise ParsingError, "Invalid ISO 8601 duration: #{scanner.string.inspect} #{reason}".strip
-        end
-
-        # Checks for various semantic errors as stated in ISO 8601 standard.
-        def validate!
-          raise_parsing_error("is empty duration") if parts.empty?
-
-          # Mixing any of Y, M, D with W is invalid.
-          if parts.key?(:weeks) && (parts.keys & DATE_COMPONENTS).any?
-            raise_parsing_error("mixing weeks with other date parts not allowed")
-          end
-
-          # Specifying an empty T part is invalid.
-          if mode == :time && (parts.keys & TIME_COMPONENTS).empty?
-            raise_parsing_error("time part marker is present but time part is empty")
-          end
-
-          fractions = parts.values.reject(&:zero?).select { |a| (a % 1) != 0 }
-          unless fractions.empty? || (fractions.size == 1 && fractions.last == @parts.values.reject(&:zero?).last)
-            raise_parsing_error "(only last part can be fractional)"
-          end
-
-          true
-        end
+  def parse!
+    if scan(ISO_P) # iso 8601
+      scan_iso_days
+      scan_iso_time if scan(ISO_T) # time part
+    else
+      scan_sql
     end
+
+    parts
+  end
+
+  private
+
+  def scan_iso_days
+    while scan(ISO_VALUE_YMWD) # day format with designators
+      add(value_of(scanner[1]), ISO_YMWD[scanner[2]])
+    end
+    if scan(ISO_ALT_YMD)
+      add(value_of(scanner[1]), 'years')
+      add(value_of(scanner[2]), 'months')
+      add(value_of(scanner[3]), 'days')
+    end
+  end
+
+  def scan_iso_time
+    while scan(ISO_VALUE_HMS) # day format with designators
+      add(value_of(scanner[1]), ISO_HMS[scanner[2]])
+    end
+    if scan(ISO_ALT_HMS)
+      add(value_of(scanner[1]), 'hours')
+      add(value_of(scanner[2]), 'minutes')
+      add(value_of(scanner[3]), 'seconds')
+    end
+  end
+
+  def scan_sql
+    scan(SQL_AT)
+    until eos?
+      if scan(SQL_VERBOSE) # traditional postgresql verbose format
+        add(value_of(scanner[1]), sql_unit(scanner[2]))
+      elsif scan(SQL_YM)
+        add(value_of(scanner[1]), 'years')
+        add(value_of(scanner[2]), 'months')
+      elsif scan(SQL_DHMS)
+        add_sql_dhms(scanner[1], scanner[2], scanner[3], scanner[4], scanner[5])
+      elsif scan(SQL_AGO)
+        invert_parts
+      else
+        binding.pry
+        raise_parsing_error("Unknown format")
+      end
+    end
+  end
+
+  def add_sql_dhms(days,sign,hours,minutes,seconds)
+    add(value_of(days), 'days') if days
+    if hours && minutes.nil?
+      if PERIOD_OR_COMMA.match? seconds # minutes:seconds
+        minutes = hours
+        hours = nil
+      else # hours:minutes
+        minutes = seconds
+        seconds = nil
+      end
+    end
+    add(value_of("#{sign}#{hours}"), 'hours') if hours
+    add(value_of("#{sign}#{minutes}"), 'minutes') if minutes
+    add(value_of("#{sign}#{seconds}"), 'seconds') if seconds
+  end
+
+  def invert_parts
+    parts.transform_values! { |value| value * -1 }
+  end
+
+  def value_of(quantity)
+    if PERIOD_OR_COMMA.match? quantity
+      quantity.tr(COMMA,PERIOD).to_f
+    else
+      quantity.to_i
+    end
+  end
+
+  def sql_unit(unit)
+    unit = unit.singularize
+    SQL_UNITS[unit] || unit
+  end
+
+  def add(quantity, unit)
+    return unless quantity && unit
+    unit = unit.singularize
+    args = UNITS[unit] || {}
+    part = args[:part] || unit.pluralize.to_sym
+    multiplier = args[:multiplier] || 1
+
+    @parts[part] += quantity * multiplier
+  end
+
+  def raise_parsing_error(reason = nil)
+    raise ParsingError, "Invalid Verbose Interval: #{scanner.string.inspect} #{reason}".strip
   end
 end
 
